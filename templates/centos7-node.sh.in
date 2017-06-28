@@ -1,0 +1,58 @@
+#!/bin/sh
+
+# Workaround AAU routing
+sudo iptables -t nat -I PREROUTING -d ${TRAEFIK_IP_PUB} -j DNAT --to-destination ${TRAEFIK_IP}
+sudo iptables -t nat -I OUTPUT -d ${TRAEFIK_IP_PUB} -j DNAT --to-destination ${TRAEFIK_IP}
+sudo iptables-save
+
+# Flannel config
+cat << EOF >> /etc/sysconfig/flanneld 
+FLANNEL_ETCD_ENDPOINTS="http://${ETCD_SERVER}:2379"
+FLANNEL_ETCD_PREFIX="/flannel/network"
+EOF
+
+# Kubernetes general config
+cat << EOF >> /etc/kubernetes/config
+KUBE_MASTER="--master=http://${ETCD_SERVER}:8080"
+EOF
+
+# Kubernetes proxy config
+cat << EOF >> /etc/kubernetes/proxy
+KUBE_PROXY_ARGS=""
+EOF
+
+# Kubernetes kubelet config
+cat << EOF >> /etc/kubernetes/kubelet
+# Listen on all addresses
+KUBELET_ADDRESS="--address=0.0.0.0"
+# Listen on port 
+KUBELET_PORT="--port=10250"
+# Use hostname from os
+KUBELET_HOSTNAME=""
+# Set URL to API server
+KUBELET_API_SERVER="--api-servers=http://${ETCD_SERVER}:8080"
+# Setup DNS
+KUBELET_ARGS="--cluster-dns=${DNS_SERVER} --cluster-domain=cluster.local"
+EOF
+
+# Authorize master server
+ssh-keyscan -H ${COCKPIT_SERVER} >> /var/lib/cockpit/known_hosts
+
+# kubectl
+kubectl config set-cluster default-cluster --server=http://${MASTER_SERVER}:8080
+kubectl config set-context default-context --cluster=default-cluster --user=default-admin
+kubectl config use-context default-context
+
+# yum-cron daily
+sed -i "s|^email_to = root|email_to = ${ADMIN_EMAIL}|" /etc/yum/yum-cron.conf
+sed -i 's|^update_messages = no|update_messages = yes|' /etc/yum/yum-cron.conf
+sed -i 's|^download_updates = no|download_updates = yes|' /etc/yum/yum-cron.conf
+sed -i 's|^apply_updates = no|apply_updates = yes|' /etc/yum/yum-cron.conf
+sed -i 's|^emit_via = stdio|emit_via = email|' /etc/yum/yum-cron.conf
+# yum-cron hourly
+sed -i "s|^email_to = root|email_to = ${ADMIN_EMAIL}|" /etc/yum/yum-cron-hourly.conf
+sed -i 's|^update_cmd = default|update_cmd = security|' /etc/yum/yum-cron-hourly.conf
+sed -i 's|^update_messages = no|update_messages = yes|' /etc/yum/yum-cron-hourly.conf
+sed -i 's|^download_updates = no|download_updates = yes|' /etc/yum/yum-cron-hourly.conf
+sed -i 's|^apply_updates = no|apply_updates = yes|' /etc/yum/yum-cron-hourly.conf
+sed -i 's|^emit_via = stdio|emit_via = email|' /etc/yum/yum-cron-hourly.conf

@@ -1,0 +1,7 @@
+export TYPE="node"
+export DISTRO="centos7"
+export IP="172.19.0.233"
+export NETMASK="255.255.255.224"
+export GATEWAY="172.19.0.225"
+export NAMESERVERS="172.18.21.2,172.18.21.34"
+export HOSTNAME="kube-node00"

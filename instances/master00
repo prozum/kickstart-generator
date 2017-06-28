@@ -1,0 +1,7 @@
+export TYPE="master"
+export DISTRO="centos7"
+export IP="172.19.0.251"
+export NETMASK="255.255.255.224"
+export GATEWAY="172.19.0.225"
+export NAMESERVERS="172.21.96.154,172.21.96.25"
+export HOSTNAME="kube-master00"

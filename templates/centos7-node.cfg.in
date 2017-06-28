@@ -1,0 +1,75 @@
+install
+
+# Accept Eula
+eula --agreed
+
+#-----------------#
+# Locale settings #
+#-----------------#
+keyboard 'dk'
+lang en_US
+timezone Europe/Copenhagen
+
+#-------------------#
+# Security settings #
+#-------------------#
+auth  --useshadow  --passalgo=sha512
+rootpw --iscrypted $6$8BahqpkPXiBPy8kf$m7nDxC2ztDJqh7a.W2OGNLgtRr5c7zrnmOT5H4gJO1UkldhmU8FPBrQPS6ILeuak0wDvcdjZMDPRUKTuvdB3t/
+firewall --disabled
+selinux --permissive
+
+#-----------------------#
+# Installation settings #
+#-----------------------#
+reboot
+text
+zerombr
+firstboot --disable
+bootloader --location=mbr
+
+#--------------------#
+# Partition settings #
+#--------------------#
+clearpart --all --initlabel
+part pv.01 --fstype="lvmpv" --ondisk=sda --size=1000 --grow
+part /boot --fstype="xfs" --ondisk=sda --size=500
+
+volgroup centos pv.01
+logvol /  --fstype="xfs" --size=1000 --grow --name=root --vgname=centos
+logvol swap  --fstype="swap" --size=2048 --name=swap --vgname=centos
+
+#-----------------#
+# System settings #
+#-----------------#
+repo --name="base" --baseurl=http://mirror.centos.org/centos/7/os/x86_64/
+repo --name="updates" --baseurl=http://mirror.centos.org/centos/7/updates/x86_64/
+repo --name="extras" --baseurl=http://mirror.centos.org/centos/7/extras/x86_64/
+repo --name="epel" --baseurl=http://dl.fedoraproject.org/pub/epel/7/x86_64
+repo --name="gluster-epel" --baseurl=http://buildlogs.centos.org/centos/7/storage/x86_64/gluster-3.10/
+url --url="http://mirror.centos.org/centos/7/os/x86_64/"
+%packages
+@base
+@core
+epel-release
+-*firmware
+-iscsi*
+-fcoe*
+-b43-openfwwf
+-efibootmgr
+vim
+tmux
+yum-cron
+ntp
+nfs-utils
+cockpit
+kubernetes-node 
+docker 
+flannel
+%end
+services --enabled=NetworkManager,sshd,yum-cron,ntpd,cockpit,kube-proxy,kubelet,docker,flanneld
+
+#------------------#
+# Network settings #
+#------------------#
+network --bootproto=static --ip=${IP} --netmask=${NETMASK} --gateway=${GATEWAY} --nameserver=${NAMESERVERS} --onboot=on --activate 
+network --hostname=${HOSTNAME}

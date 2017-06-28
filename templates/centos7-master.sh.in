@@ -1,0 +1,299 @@
+#!/bin/sh
+# etcd config
+cat << EOF >> /etc/etcd/etcd.conf
+ETCD_NAME=default
+ETCD_DATA_DIR="/var/lib/etcd/default.etcd"
+ETCD_LISTEN_CLIENT_URLS="http://0.0.0.0:2379"
+ETCD_ADVERTISE_CLIENT_URLS="http://localhost:2379"
+EOF
+
+# General Kubernetes config
+cat << EOF >> /etc/kubernetes/config
+KUBE_LOGTOSTDERR="--logtostderr=true"
+KUBE_LOG_LEVEL="--v=0"
+KUBE_ALLOW_PRIV="--allow-privileged=true"
+KUBE_MASTER="--master=http://127.0.0.1:8080"
+EOF
+
+# API server config
+cat << EOF >> /etc/kubernetes/apiserver
+KUBE_API_ADDRESS="--address=0.0.0.0"
+KUBE_API_PORT="--port=8080"
+KUBELET_PORT="--kubelet-port=10250"
+KUBE_SERVICE_ADDRESSES="--service-cluster-ip-range=10.254.0.0/16"
+KUBE_ETCD_SERVERS="--etcd-servers=http://127.0.0.1:2379"
+KUBE_ADMISSION_CONTROL="--admission-control=NamespaceLifecycle,NamespaceExists,LimitRanger,SecurityContextDeny,ServiceAccount,ResourceQuota"
+KUBE_API_ARGS="--service-account-key-file=${SERVICE_ACCOUNT_KEY} --client-ca-file=${CERT_DIR}/ca.crt --tls-cert-file=${CERT_DIR}/server.cert --tls-private-key-file=${CERT_DIR}/server.key"
+EOF
+
+# Controller manager config
+cat << EOF >> /etc/kubernetes/controller-manager
+KUBE_CONTROLLER_MANAGER_ARGS="--service-account-private-key-file=${SERVICE_ACCOUNT_KEY} --root-ca-file=${CERT_DIR}/ca.crt"
+EOF
+
+# Scheduler config
+cat << EOF >> /etc/kubernetes/scheduler
+KUBE_SCHEDULER_ARGS=""
+EOF
+
+# Flannel config
+cat << EOF > /etc/sysconfig/flanneld
+FLANNEL_ETCD_ENDPOINTS="http://127.0.0.1:2379"
+FLANNEL_ETCD_PREFIX="/flannel/network"
+EOF
+
+# Start and enable etcd
+systemctl start etcd
+systemctl enable etcd
+
+# Start and enable flanneld
+etcdctl mk /flannel/network/config "{ \"Network\": \"172.30.0.0/16\" }"
+systemctl start flanneld
+systemctl enable flanneld
+
+# Generate ssl keys
+mkdir -p ${CERT_DIR}
+export CERT_GROUP=kube
+wget https://raw.githubusercontent.com/kubernetes/kubernetes/master/cluster/saltbase/salt/generate-cert/make-ca-cert.sh
+sh make-ca-cert.sh "${IP}" "IP:${IP},IP:10.254.0.1,DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.cluster.local"
+
+# Generate account service key
+openssl genrsa -out "${SERVICE_ACCOUNT_KEY}" 2048
+
+# kubectl
+kubectl config set-cluster default-cluster --server=http://${MASTER_SERVER}:8080
+kubectl config set-context default-context --cluster=default-cluster --user=default-admin
+kubectl config use-context default-context
+
+# Start and enable Kubernetes
+systemctl start kube-apiserver kube-controller-manager kube-scheduler
+systemctl enable kube-apiserver kube-controller-manager kube-scheduler
+
+# DNS server
+cat << EOF >> dns.yaml
+apiVersion: v1
+kind: ReplicationController
+metadata:
+  name: kube-dns-v20
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    version: v20
+    kubernetes.io/cluster-service: "true"
+spec:
+  replicas: 1
+  selector:
+    k8s-app: kube-dns
+    version: v20
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-dns
+        version: v20
+      annotations:
+        scheduler.alpha.kubernetes.io/critical-pod: ''
+        scheduler.alpha.kubernetes.io/tolerations: '[{"key":"CriticalAddonsOnly", "operator":"Exists"}]'
+    spec:
+      containers:
+      - name: kubedns
+        image: gcr.io/google_containers/kubedns-amd64:1.8
+        resources:
+          # TODO: Set memory limits when we've profiled the container for large
+          # clusters, then set request = limit to keep this container in
+          # guaranteed class. Currently, this container falls into the
+          # "burstable" category so the kubelet doesn't backoff from restarting it.
+          limits:
+            memory: 170Mi
+          requests:
+            cpu: 100m
+            memory: 70Mi
+        livenessProbe:
+          httpGet:
+            path: /healthz-kubedns
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 60
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /readiness
+            port: 8081
+            scheme: HTTP
+          # we poll on pod startup for the Kubernetes master service and
+          # only setup the /readiness HTTP server once that's available.
+          initialDelaySeconds: 3
+          timeoutSeconds: 5
+        args:
+        # command = "/kube-dns"
+        - --domain=cluster.local.
+        - --dns-port=10053
+        ports:
+        - containerPort: 10053
+          name: dns-local
+          protocol: UDP
+        - containerPort: 10053
+          name: dns-tcp-local
+          protocol: TCP
+      - name: dnsmasq
+        image: gcr.io/google_containers/kube-dnsmasq-amd64:1.4
+        livenessProbe:
+          httpGet:
+            path: /healthz-dnsmasq
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 60
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 5
+        args:
+        - --cache-size=1000
+        - --no-resolv
+        - --server=127.0.0.1#10053
+        - --log-facility=-
+        ports:
+        - containerPort: 53
+          name: dns
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+      - name: healthz
+        image: gcr.io/google_containers/exechealthz-amd64:1.2
+        resources:
+          limits:
+            memory: 50Mi
+          requests:
+            cpu: 10m
+            # Note that this container shouldn't really need 50Mi of memory. The
+            # limits are set higher than expected pending investigation on #29688.
+            # The extra memory was stolen from the kubedns container to keep the
+            # net memory requested by the pod constant.
+            memory: 50Mi
+        args:
+        - --cmd=nslookup kubernetes.default.svc.cluster.local 127.0.0.1 >/dev/null
+        - --url=/healthz-dnsmasq
+        - --cmd=nslookup kubernetes.default.svc.cluster.local 127.0.0.1:10053 >/dev/null
+        - --url=/healthz-kubedns
+        - --port=8080
+        - --quiet
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+      dnsPolicy: Default  # Don't use cluster DNS.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-dns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    kubernetes.io/cluster-service: "true"
+    kubernetes.io/name: "KubeDNS"
+spec:
+  selector:
+    k8s-app: kube-dns
+  clusterIP: ${DNS_SERVER}
+  ports:
+  - name: dns
+    port: 53
+    protocol: UDP
+  - name: dns-tcp
+    port: 53
+    protocol: TCP
+EOF
+kubectl create -f dns.yaml
+
+# Traefik
+cat << EOF >> traefik.yaml
+kind: Deployment
+apiVersion: extensions/v1beta1
+metadata:
+  name: traefik-ingress-controller
+  namespace: kube-system
+  labels:
+    k8s-app: traefik-ingress-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: traefik-ingress-lb
+  template:
+    metadata:
+      labels:
+        k8s-app: traefik-ingress-lb
+        name: traefik-ingress-lb
+    spec:
+      terminationGracePeriodSeconds: 60
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/hostname: ${TRAEFIK_NODE} # Domains point to this node
+      containers:
+      - image: traefik
+        name: traefik-ingress-lb
+        resources:
+          limits:
+            cpu: 200m
+            memory: 30Mi
+          requests:
+            cpu: 100m
+            memory: 20Mi
+        ports:
+        - containerPort: 80
+          hostPort: 80
+        - containerPort: 8080
+        args:
+        - --web
+        - --kubernetes
+---        
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik-web-ui
+  namespace: kube-system
+spec:
+  selector:
+    k8s-app: traefik-ingress-lb
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: traefik-web-ui
+  namespace: kube-system
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  rules:
+  - host: traefik.giraf.cs.aau.dk
+    http:
+      paths:
+      - backend:
+          serviceName: traefik-web-ui
+          servicePort: 80
+EOF
+kubectl create -f traefik.yaml
+
+# NFS
+mkdir /var/nfsshare
+chmod -R 777 /var/nfsshare/
+echo "/var/nfsshare    kube-*(rw,sync,no_root_squash,no_all_squash)" >> /etc/exports
+
+# yum-cron daily
+sed -i "s|^email_to = root|email_to = ${ADMIN_EMAIL}|" /etc/yum/yum-cron.conf
+sed -i 's|^update_messages = no|update_messages = yes|' /etc/yum/yum-cron.conf
+sed -i 's|^download_updates = no|download_updates = yes|' /etc/yum/yum-cron.conf
+sed -i 's|^apply_updates = no|apply_updates = yes|' /etc/yum/yum-cron.conf
+sed -i 's|^emit_via = stdio|emit_via = email|' /etc/yum/yum-cron.conf
+# yum-cron hourly
+sed -i "s|^email_to = root|email_to = ${ADMIN_EMAIL}|" /etc/yum/yum-cron-hourly.conf
+sed -i 's|^update_cmd = default|update_cmd = security|' /etc/yum/yum-cron-hourly.conf
+sed -i 's|^update_messages = no|update_messages = yes|' /etc/yum/yum-cron-hourly.conf
+sed -i 's|^download_updates = no|download_updates = yes|' /etc/yum/yum-cron-hourly.conf
+sed -i 's|^apply_updates = no|apply_updates = yes|' /etc/yum/yum-cron-hourly.conf
+sed -i 's|^emit_via = stdio|emit_via = email|' /etc/yum/yum-cron-hourly.conf
+
